@@ -103,6 +103,20 @@ expiring under load means every in-flight request recomputes the same value — 
 database queries for one row. The loader runs outside every cache lock, so a slow load never
 blocks unrelated keys.
 
+Getting this right took two attempts. The first version claimed the load with an atomic
+`putIfAbsent` on an in-flight map, which looks sufficient and is not: a thread whose cache
+miss happened *before* the winner stored its value, but whose claim happened *after* the
+winner removed its marker, sees no marker and loads the key a second time. The second value
+then replaces the first, discarding any state it carried — for `KeyedRateLimiter` that meant
+a key silently getting a second full allowance.
+
+The fix is a re-check of the cache after winning the claim. It is sufficient because the
+winner stores before removing its marker, and a claim can only succeed once the marker is
+gone, so the store is guaranteed visible.
+
+This was caught by CI, not locally. Pinned to four cores to match a CI runner, the stress
+suite failed **7 times in 15** without the re-check and **0 in 15** with it.
+
 ### The keyed limiter's memory leak, avoided
 
 The natural implementation of a per-key limiter is `ConcurrentHashMap<K, RateLimiter>` with

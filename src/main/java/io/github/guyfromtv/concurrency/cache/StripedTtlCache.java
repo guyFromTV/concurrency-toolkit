@@ -90,6 +90,14 @@ public final class StripedTtlCache<K, V> implements TtlCache<K, V> {
     @Override
     public Optional<V> get(K key) {
         Objects.requireNonNull(key, "key");
+        return lookup(key, true);
+    }
+
+    /**
+     * @param recordStats false for internal lookups that must not be counted as a
+     *     caller request, so the double-check inside a load does not inflate the counters
+     */
+    private Optional<V> lookup(K key, boolean recordStats) {
         Segment<K, V> segment = segmentFor(key);
         long now = ticker.nanoTime();
 
@@ -97,18 +105,24 @@ public final class StripedTtlCache<K, V> implements TtlCache<K, V> {
         try {
             Node<K, V> node = segment.table.get(key);
             if (node == null) {
-                misses.increment();
+                if (recordStats) {
+                    misses.increment();
+                }
                 return Optional.empty();
             }
             if (node.isExpiredAt(now)) {
                 segment.unlink(node);
                 segment.table.remove(key);
                 expirations.increment();
-                misses.increment();
+                if (recordStats) {
+                    misses.increment();
+                }
                 return Optional.empty();
             }
             segment.moveToFront(node);
-            hits.increment();
+            if (recordStats) {
+                hits.increment();
+            }
             return Optional.of(node.value);
         } finally {
             segment.lock.unlock();
@@ -134,6 +148,23 @@ public final class StripedTtlCache<K, V> implements TtlCache<K, V> {
         }
 
         try {
+            // Re-check before doing the work. Without this there is a race: this thread's
+            // miss above can happen before another thread stores its freshly loaded
+            // value, while this thread's claim happens after that thread removed its
+            // in-flight marker. Both threads then load the same key, and the second
+            // value replaces the first -- so any state the first value carried, such as
+            // a rate limiter's spent permits, is silently discarded.
+            //
+            // The check is sufficient because the winner stores into the cache before
+            // removing its marker, and this claim only succeeded because the marker was
+            // already gone, so that store is guaranteed visible here.
+            Optional<V> loadedByAnother = lookup(key, false);
+            if (loadedByAnother.isPresent()) {
+                V value = loadedByAnother.get();
+                mine.complete(value);
+                return value;
+            }
+
             V value = loader.apply(key);
             Objects.requireNonNull(value, "loader returned null for key " + key);
             put(key, value);

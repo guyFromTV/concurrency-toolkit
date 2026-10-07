@@ -192,15 +192,16 @@ class ConcurrencyStressTest {
     @DisplayName("A keyed limiter keeps keys independent and bounded")
     void keyedLimiterIsPerKeyAndBounded() throws Exception {
         ManualTicker frozen = new ManualTicker();
-        int maximumKeys = 64;
+        // Deliberately far above the 8 keys used, so eviction cannot interfere: this test
+        // is about per-key independence, and the bound is covered separately below.
         KeyedRateLimiter<String> limiter = KeyedRateLimiter.create(
-                maximumKeys,
+                4_096,
                 Duration.ofHours(1),
                 frozen,
                 key -> new TokenBucketRateLimiter(5, 1, Duration.ofHours(1), frozen));
 
-        // Only 8 distinct keys, well inside the bound, so no limiter is evicted and each
-        // key's allowance is exact.
+        // Each key must get exactly its own allowance. A total above 5 for any key means
+        // two limiter instances existed for it, which is the single-flight race.
         ConcurrentHashMap<String, LongAdder> grantsPerKey = new ConcurrentHashMap<>();
         runConcurrently(THREADS, () -> {
             for (int i = 0; i < 200; i++) {
